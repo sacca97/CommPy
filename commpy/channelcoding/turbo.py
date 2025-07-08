@@ -9,7 +9,7 @@ from commpy.channelcoding import conv_encode
 from commpy.channelcoding.convcode import Trellis
 from commpy.channelcoding.interleavers import _Interleaver
 from commpy.utilities import dec2bitarray
-
+from numba import njit
 
 # from commpy.channelcoding.map_c import backward_recursion, forward_recursion_decoding
 
@@ -77,6 +77,152 @@ def _compute_branch_prob(
     branch_prob = exp(-(x * x + y * y) / (2 * noise_variance))
 
     return branch_prob
+
+
+@njit(cache=True)
+def dec2bitarray_numba(number: int, num_bits: int) -> np.ndarray:
+    """
+    Numba-compatible function to convert a decimal integer to a NumPy bit array.
+    """
+    result = np.zeros(num_bits, dtype=np.int8)
+    for i in range(num_bits):
+        result[i] = (number >> (num_bits - 1 - i)) & 1
+    return result
+
+
+@njit(cache=True)
+def backward_recursion_numba(
+    # Trellis attributes passed directly
+    number_states: int,
+    number_inputs: int,
+    n: int,
+    next_state_table: np.ndarray,
+    output_table: np.ndarray,
+    # The rest of the inputs
+    msg_length: int,
+    noise_variance: float,
+    sys_symbols: np.ndarray,
+    non_sys_symbols: np.ndarray,
+    branch_probs: np.ndarray,
+    priors: np.ndarray,
+    b_state_metrics: np.ndarray,
+):
+    """
+    A Numba-accelerated version of the backward recursion algorithm.
+    """
+    # Step 1: Pre-computation (Compiled by Numba)
+    codeword_arrays = np.zeros((number_states, number_inputs, n), dtype=np.int8)
+    for state in range(number_states):
+        for input_val in range(number_inputs):
+            code_symbol = output_table[state, input_val]
+            codeword_arrays[state, input_val] = dec2bitarray_numba(code_symbol, n)
+
+    msg_bpsk = 2 * codeword_arrays[:, :, 0] - 1
+    parity_bpsk = 2 * codeword_arrays[:, :, 1] - 1
+    inv_2var = -0.5 / noise_variance
+
+    # Step 2: Backward Recursion
+    for reverse_time_index in range(msg_length, 0, -1):
+        time_idx = reverse_time_index - 1
+
+        # Branch probability computation
+        rx_sys = sys_symbols[time_idx]
+        rx_parity = non_sys_symbols[time_idx]
+        msg_contrib = (rx_sys - msg_bpsk) ** 2
+        parity_contrib = (rx_parity - parity_bpsk) ** 2
+        branch_prob_matrix = np.exp(inv_2var * (msg_contrib + parity_contrib))
+
+        branch_probs[:, :, time_idx] = branch_prob_matrix.T
+
+        # Backward metric (beta) computation
+        current_priors = priors[:, time_idx]
+        current_b_metrics = b_state_metrics[:, reverse_time_index]
+
+        # --- CORRECTION ---
+        # Replace unsupported advanced indexing `current_b_metrics[next_state_table]`
+        # with an explicit loop, which Numba can compile and optimize.
+        indexed_b_metrics = np.empty((number_states, number_inputs), dtype=np.float64)
+        for s in range(number_states):
+            for i in range(number_inputs):
+                next_state = next_state_table[s, i]
+                indexed_b_metrics[s, i] = current_b_metrics[next_state]
+
+        weighted_metrics = (
+            branch_prob_matrix * current_priors[np.newaxis, :] * indexed_b_metrics
+        )
+
+        new_b_metrics = np.sum(weighted_metrics, axis=1)
+
+        # Normalize and update
+        metric_sum = np.sum(new_b_metrics)
+        if metric_sum > 0:
+            b_state_metrics[:, time_idx] = new_b_metrics / metric_sum
+        else:
+            b_state_metrics[:, time_idx] = new_b_metrics
+
+
+def backward_recursion_v3(
+    trellis: Trellis,
+    msg_length: int,
+    noise_variance: float,
+    sys_symbols: np.ndarray,
+    non_sys_symbols: np.ndarray,
+    branch_probs: np.ndarray,
+    priors: np.ndarray,
+    b_state_metrics: np.ndarray,
+):
+    number_states = trellis.number_states
+    number_inputs = trellis.number_inputs
+    next_state_table = trellis.next_state_table
+    output_table = trellis.output_table
+    n = trellis.n
+
+    # Pre-compute all codeword arrays once
+    codeword_arrays = np.zeros((number_states, number_inputs, n), dtype=np.int8)
+    for state in range(number_states):
+        for input_val in range(number_inputs):
+            code_symbol = output_table[state, input_val]
+            codeword_arrays[state, input_val] = dec2bitarray(code_symbol, n)
+
+    msg_bits = codeword_arrays[:, :, 0]
+    parity_bits = codeword_arrays[:, :, 1]
+
+    # Backward recursion with vectorization
+    for reverse_time_index in reversed(range(1, msg_length + 1)):
+        time_idx = reverse_time_index - 1
+
+        # Vectorized branch probability computation
+        rx_sys = sys_symbols[time_idx]
+        rx_parity = non_sys_symbols[time_idx]
+
+        msg_contrib = (rx_sys - (2 * msg_bits - 1)) ** 2
+        parity_contrib = (rx_parity - (2 * parity_bits - 1)) ** 2
+        branch_prob_matrix = np.exp(
+            -0.5 / noise_variance * (msg_contrib + parity_contrib)
+        )
+
+        # Store branch probabilities
+        branch_probs[:, :, time_idx] = branch_prob_matrix.T
+
+        # Vectorized backward metric computation
+        current_priors = priors[:, time_idx]
+        current_b_metrics = b_state_metrics[:, reverse_time_index]
+
+        # Use advanced indexing for efficient computation
+        next_states = next_state_table  # Shape: (num_states, num_inputs)
+        weighted_metrics = (
+            branch_prob_matrix
+            * current_priors[np.newaxis, :]
+            * current_b_metrics[next_states]
+        )
+
+        # Sum over inputs to get new backward metrics
+        b_state_metrics[:, time_idx] = np.sum(weighted_metrics, axis=1)
+
+        # Normalize
+        metric_sum = b_state_metrics[:, time_idx].sum()
+        if metric_sum > 0:
+            b_state_metrics[:, time_idx] /= metric_sum
 
 
 def backward_recursion_v2(
@@ -208,6 +354,89 @@ def _backward_recursion(
         ].sum()
 
 
+@njit(cache=True)
+def forward_recursion_decoding_numba(
+    # Trellis attributes are passed directly as Numba can't handle custom classes
+    number_states: int,
+    next_state_table: np.ndarray,
+    # The rest of the inputs are the same
+    mode: str,
+    msg_length: int,
+    b_state_metrics: np.ndarray,
+    f_state_metrics: np.ndarray,
+    branch_probs: np.ndarray,
+    app: np.ndarray,
+    L_int: np.ndarray,
+    priors: np.ndarray,
+    L_ext: np.ndarray,
+    decoded_bits: np.ndarray,
+):
+    """
+    A Numba-accelerated version of the forward recursion decoding algorithm.
+    """
+    branch_probs_T = np.transpose(branch_probs, (1, 0, 2))
+    next_state_flat = next_state_table.ravel()
+    epsilon = 1e-15  # Use a small constant for stability
+
+    # Forward Recursion
+    for time_index in range(1, msg_length + 1):
+        # --- Step 1: Alpha Calculation ---
+        alpha_prev = f_state_metrics[:, 0]
+        gamma_t = branch_probs_T[:, :, time_index - 1]
+        priors_t = priors[:, time_index - 1]
+
+        # CORRECTED: Use np.newaxis for broadcasting instead of .reshape()
+        # This works correctly with non-contiguous array views in Numba.
+        transition_values = (
+            alpha_prev[:, np.newaxis] * gamma_t * priors_t[np.newaxis, :]
+        )
+
+        # Use Numba's supported np.bincount, which is efficient
+        alpha_next = np.bincount(
+            next_state_flat, weights=transition_values.ravel(), minlength=number_states
+        )
+
+        # --- Step 2: APP Calculation ---
+        beta_next = b_state_metrics[:, time_index]
+
+        # This explicit loop for mapping beta is a robust way to handle
+        # advanced indexing in Numba.
+        beta_next_mapped = np.empty_like(next_state_table, dtype=np.float64)
+        for i in range(number_states):
+            for j in range(next_state_table.shape[1]):
+                beta_next_mapped[i, j] = beta_next[next_state_table[i, j]]
+
+        app_terms = (alpha_prev[:, np.newaxis] * gamma_t) * beta_next_mapped
+
+        # Numba requires mutation of array arguments to be explicit.
+        app_sum = np.sum(app_terms, axis=0)
+        app[0] = app_sum[0]
+        app[1] = app_sum[1]
+
+        if app[0] == 0:
+            app[0] = epsilon
+        if app[1] == 0:
+            app[1] = epsilon
+
+        # --- Step 3: LLR Calculation and Decoding ---
+        lappr = L_int[time_index - 1] + log(app[1] / app[0])
+        L_ext[time_index - 1] = lappr
+
+        if mode == "decode":
+            if lappr > 0:
+                decoded_bits[time_index - 1] = 1
+            else:
+                decoded_bits[time_index - 1] = 0
+
+        # --- Step 4: Normalization and State Update ---
+        temp = np.sum(alpha_next)
+        if temp == 0:
+            temp = epsilon
+
+        # In-place update of the f_state_metrics array view
+        f_state_metrics[:, 0] = alpha_next / temp
+
+
 def forward_recursion_decoding_v2(
     trellis: Trellis,
     mode: str,
@@ -263,10 +492,14 @@ def forward_recursion_decoding_v2(
         app_terms = (alpha_prev[:, np.newaxis] * gamma_t) * beta_next[next_state_table]
 
         # Sum over the current_state axis (axis 0) to get the final app values
-        app = np.sum(app_terms, axis=0)
+        app[:] = np.sum(app_terms, axis=0)
 
+        epsilon = np.finfo(float).eps
+        if app[0] == 0:
+            app[0] = epsilon
+        if app[1] == 0:
+            app[1] = epsilon
         # --- Step 3: LLR Calculation and Decoding (Unchanged) ---
-
         lappr = L_int[time_index - 1] + log(app[1] / app[0])
         L_ext[time_index - 1] = lappr
 
@@ -276,7 +509,10 @@ def forward_recursion_decoding_v2(
         # --- Step 4: Normalization and State Update ---
 
         # Normalize the new forward state metrics in-place
-        alpha_next /= np.sum(alpha_next)
+        temp = np.sum(alpha_next)
+        if temp == 0:
+            temp = epsilon
+        alpha_next /= temp
 
         # Update the state metrics for the next iteration
         f_state_metrics[:, 0] = alpha_next
@@ -396,32 +632,56 @@ def map_decode_v2(
     # k = trellis.k
     # n = trellis.n
     # rate = float(k) / n
+    # number_states = trellis.number_states
+    # number_inputs = trellis.number_inputs
+    # msg_length = len(sys_symbols)
+
+    # # Pre-allocate all arrays to avoid repeated allocations
+    # f_state_metrics = zeros([number_states, 2])
+    # f_state_metrics[0][0] = 1
+
+    # b_state_metrics = zeros([number_states, msg_length + 1])
+    # b_state_metrics[:, msg_length] = 1
+
+    # branch_probs = zeros([number_inputs, number_states, msg_length + 1])
+    # app = zeros(number_inputs)
+
+    # decoded_bits = zeros(msg_length, dtype=int)
+    # L_ext = zeros(msg_length)
+
+    # # Vectorized prior computation (avoid exp in loop)
+    # exp_L_int = np.exp(L_int)
+    # priors = empty([2, msg_length])
+    # priors[0, :] = 1 / (1 + exp_L_int)
+    # priors[1, :] = 1 - priors[0, :]
     number_states = trellis.number_states
     number_inputs = trellis.number_inputs
     msg_length = len(sys_symbols)
 
-    # Pre-allocate all arrays to avoid repeated allocations
-    f_state_metrics = zeros([number_states, 2])
-    f_state_metrics[0][0] = 1
+    # Pre-allocate all arrays
+    f_state_metrics = np.zeros([number_states, 2])
+    f_state_metrics[0, 0] = 1.0
 
-    b_state_metrics = zeros([number_states, msg_length + 1])
-    b_state_metrics[:, msg_length] = 1
+    b_state_metrics = np.zeros([number_states, msg_length + 1])
+    b_state_metrics[:, msg_length] = 1.0 / number_states
 
-    branch_probs = zeros([number_inputs, number_states, msg_length + 1])
-    app = zeros(number_inputs)
+    branch_probs = np.zeros([number_inputs, number_states, msg_length])
+    app = np.zeros(number_inputs)
+    decoded_bits = np.zeros(msg_length, dtype=np.int8)
+    L_ext = np.zeros(msg_length)
 
-    decoded_bits = zeros(msg_length, dtype=int)
-    L_ext = zeros(msg_length)
-
-    # Vectorized prior computation (avoid exp in loop)
+    # Vectorized prior computation
     exp_L_int = np.exp(L_int)
-    priors = empty([2, msg_length])
-    priors[0, :] = 1 / (1 + exp_L_int)
-    priors[1, :] = 1 - priors[0, :]
+    priors = np.empty([2, msg_length])
+    priors[0, :] = 1.0 / (1.0 + exp_L_int)
+    priors[1, :] = 1.0 - priors[0, :]
 
-    # Backward recursion
-    backward_recursion_v2(
-        trellis,
+    backward_recursion_numba(
+        trellis.number_states,
+        trellis.number_inputs,
+        trellis.n,
+        trellis.next_state_table,
+        trellis.output_table,
         msg_length,
         noise_variance,
         sys_symbols,
@@ -431,9 +691,36 @@ def map_decode_v2(
         b_state_metrics,
     )
 
+    # Backward recursion
+    # backward_recursion_v3(
+    #     trellis,
+    #     msg_length,
+    #     noise_variance,
+    #     sys_symbols,
+    #     non_sys_symbols,
+    #     branch_probs,
+    #     priors,
+    #     b_state_metrics,
+    # )
+
     # Forward recursion
-    forward_recursion_decoding_v2(
-        trellis,
+    # forward_recursion_decoding_v2(
+    #     trellis,
+    #     mode,
+    #     msg_length,
+    #     b_state_metrics,
+    #     f_state_metrics,
+    #     branch_probs,
+    #     app,
+    #     L_int,
+    #     priors,
+    #     L_ext,
+    #     decoded_bits,
+    # )
+
+    forward_recursion_decoding_numba(
+        trellis.number_states,
+        trellis.next_state_table,
         mode,
         msg_length,
         b_state_metrics,
@@ -561,6 +848,19 @@ def map_decode(
     )
 
     return [L_ext, decoded_bits]
+
+
+def turbo_decode_v3(
+    sys_symbols,
+    non_sys_symbols_1,
+    non_sys_symbols_2,
+    trellis,
+    noise_variance,
+    number_iterations,
+    interleaver: _Interleaver,
+    L_int=None,
+):
+    pass
 
 
 def turbo_decode_v2(
