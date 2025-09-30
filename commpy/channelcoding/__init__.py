@@ -78,6 +78,7 @@ from commpy.channelcoding.turbo import (
     map_decode,
     turbo_decode,
     turbo_decode_v2,
+    turbo_decode_v2_accelerated,
 )
 
 try:
